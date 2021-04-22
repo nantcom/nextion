@@ -131,13 +131,19 @@ namespace NC.Nextion
                     buffer[ms.Position - 2] == 255 &&
                     buffer[ms.Position - 3] == 255)
                 {
-                    // found ending, return command since lastFoundPosition to just before ending
-                    yield return new NextionResponse()
+                    var response = new NextionResponse();
+
+                    response.Code = "0x" + buffer[lastFoundPos].ToString("X2");
+
+                    var hasData = ms.Position - lastFoundPos > 4;
+                    if (hasData)
                     {
-                        Code = "0x" + buffer[lastFoundPos].ToString("X2"),
-                        Data = ms.Position - lastFoundPos <= 4 ? null :
-                            System.Text.Encoding.ASCII.GetString(buffer, (int)lastFoundPos + 1, (int)ms.Position - 4 - (int)lastFoundPos)
-                    };
+                        response.ByteData = new byte[(int)ms.Position - 4 - (int)lastFoundPos];
+                        Array.Copy(buffer, (int)lastFoundPos + 1, response.ByteData, 0, response.ByteData.Length);
+                    }
+
+                    // found ending, return command since lastFoundPosition to just before ending
+                    yield return response;
 
                     lastFoundPos = ms.Position;
                 }
@@ -315,6 +321,18 @@ namespace NC.Nextion
             {
                 throw new TimeoutException("Timed out waiting for connection to close");
             }
+        }
+
+        /// <summary>
+        /// Wait until disconnected from device
+        /// </summary>
+        /// <returns></returns>
+        public Task WaitUntilDisconnect()
+        {
+            return Task.Run(() =>
+            {
+                _WaitForDisconnect.WaitOne();
+            });
         }
 
         /// <summary>
