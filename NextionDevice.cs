@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.IO.Ports;
 using System.Linq;
+using System.Reactive.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -12,8 +13,6 @@ namespace NC.Nextion
     public sealed partial class NextionDevice : IDisposable
     {
         private static readonly string TERMINATION = System.Text.Encoding.ASCII.GetString(new byte[] { 255, 255, 255 });
-
-        private SerialPort _Port;
 
         /// <summary>
         /// COM Port connected to device
@@ -56,50 +55,11 @@ namespace NC.Nextion
         public bool IsSimulator { get; private set; }
 
         /// <summary>
-        /// Whether the serial port was removed
-        /// </summary>
-        public bool IsDisposed { get; private set; }
-
-        /// <summary>
-        /// Whether the device is connected
-        /// </summary>
-        public bool IsConnected
-        {
-            get
-            {
-                if (_Port != null)
-                {
-                    return _Port.IsOpen;
-                }
-
-                return false;
-            }
-        }
-
-        /// <summary>
-        /// Create Instance of NextionDevice for use with Nextion Simulator
-        /// </summary>
-        /// <param name="portName"></param>
-        public NextionDevice(string portName, int baudRate)
-        {
-            this.Model = "Simulator";
-            this.MCUCode = "Virtual";
-            this.Serial = "Virtual 01";
-            this.IsHasTouch = true;
-            this.FlashSize = 40000;
-            this.COMPort = portName;
-            this.COMBaudRate = baudRate;
-            this.IsSimulator = true;
-
-            this.Initialize(_Port_DataReceived);
-        }
-
-        /// <summary>
         /// Create Instance of NextionDevice from find result
         /// </summary>
         /// <param name="result"></param>
-        public NextionDevice( NextionDeviceFindResult result )
-            : this( result.COMPort, result.COMBaudRate, result.ResponseString)
+        public NextionDevice(NextionDeviceFindResult result)
+            : this(result.COMPort, result.COMBaudRate, result.ResponseString)
         {
 
         }
@@ -117,35 +77,6 @@ namespace NC.Nextion
             this.COMBaudRate = baudRate;
         }
 
-        private void Initialize(SerialDataReceivedEventHandler portHandler, int receiveThreshold = 4)
-        {
-            if (this.IsDisposed)
-            {
-                this.IsDisposed = false;
-                GC.ReRegisterForFinalize(this);
-            }
-
-            if (_Port != null)
-            {
-                if (_Port.IsOpen)
-                {
-                    _Port.DiscardInBuffer();
-                    _Port.DiscardOutBuffer();
-                    _Port.Close();
-                }
-                _Port.Dispose();
-            }
-
-            _Port = new SerialPort(this.COMPort, this.COMBaudRate, Parity.None, 8, StopBits.One);
-            _Port.Open();
-
-            _Port.WriteTimeout = 1000;
-
-            _Port.ReceivedBytesThreshold = receiveThreshold;
-            _Port.DataReceived += portHandler;
-            _Port.DiscardInBuffer();
-        }
-
         private void ParseReturnString(string returnString)
         {
             if (string.IsNullOrEmpty(returnString))
@@ -153,382 +84,356 @@ namespace NC.Nextion
                 throw new ArgumentNullException(returnString);
             }
 
-            var temp = returnString.Substring(6, returnString.Length - 9);
+            // sample:
+            // "comok 1,30601-0,NX3224T024_011R,154,61488,DE6970480F7C2E34,4194304";
 
-            var parts = temp.Split(',');
+            var parts = returnString.Substring(6).Split(',');
 
             this.IsHasTouch = parts[0] == "1";
             this.Model = parts[2];
             this.MCUCode = parts[4];
             this.Serial = parts[5];
             this.FlashSize = int.Parse(parts[6]);
+
+            this.IsSimulator = this.Model == "Simulator";
         }
 
         /// <summary>
-        /// Connect to Nextion Device, If COM Port is already open - it will be closed and reconnected
-        /// Upon connection
+        /// when set to true, parser will wait for 0x05 byte
+        /// and return NextionResponse
         /// </summary>
-        public void Connect()
-        {
-            this.Initialize(_Port_DataReceived);
+        private bool _IsUploadingFirmware;
+        private IObservable<NextionResponse> _ResponseSubject;
+        private CancellationTokenSource _ResponseCanceller;
+        private ManualResetEvent _WaitForDisconnect = new(false);
 
-            if (this.IsSimulator == false)
+        /// <summary>
+        /// Split incoming responses
+        /// </summary>
+        /// <param name="ms"></param>
+        /// <returns></returns>
+        private IEnumerable<NextionResponse> SplitResponse(MemoryStream ms)
+        {
+            var buffer = ms.GetBuffer();
+
+            long lastFoundPos = ms.Position;
+
+            while (ms.Position < ms.Length)
             {
-                NextionDevice.IssueBroadcastCommand(_Port, "addr=0");
-                this.BatchCommands(new string[] {
-                    "addr=0",
-                    "ussp=0",
-                    "thsp=0",
-                    "thup=1",
-                    "bkcmd=2",
-                    "dim=0",
-                    "sleep=0",
-                    "dim=0",
-                });
+                ms.Position += 1;
+
+                if (ms.Position < 3)
+                {
+                    continue;
+                }
+
+                if (buffer[ms.Position - 1] == 255 &&
+                    buffer[ms.Position - 2] == 255 &&
+                    buffer[ms.Position - 3] == 255)
+                {
+                    // found ending, return command since lastFoundPosition to just before ending
+                    yield return new NextionResponse()
+                    {
+                        Code = "0x" + buffer[lastFoundPos].ToString("X2"),
+                        Data = ms.Position - lastFoundPos <= 4 ? null :
+                            System.Text.Encoding.ASCII.GetString(buffer, (int)lastFoundPos + 1, (int)ms.Position - 4 - (int)lastFoundPos)
+                    };
+
+                    lastFoundPos = ms.Position;
+                }
             }
+
         }
 
         /// <summary>
-        /// If this flag is set, _Port_DataReceived will not process incoming data
+        /// Connect to Nextion Device and observe for response.
+        /// 
+        /// The port will be closed/disposed as soon as last observer is disconnected.
+        /// 
+        /// Upon registration, observer is guaranteed to receive latest response from Nextion Device, which includes a Port object to send data back
+        /// 
         /// </summary>
-        private bool _StopResponseParsing = false;
-
-        private List<int> _InBuffer = new List<int>(1024);
-        private ManualResetEvent _WaitResponse = new ManualResetEvent(false);
-
-        private void _Port_DataReceived(object sender, SerialDataReceivedEventArgs e)
+        /// <returns>IDispoable objects which can be used to disconnect from device by calling dispose</returns>
+        public IDisposable Connect(Action<NextionResponse> observer, Action onCompleted = null)
         {
-            if (_StopResponseParsing)
+            if (_ResponseSubject != null)
+            {
+                return _ResponseSubject.Subscribe(observer);
+            }
+
+            _WaitForDisconnect.Reset();
+
+            _ResponseCanceller = new CancellationTokenSource();
+            _ResponseSubject = Observable.Create<NextionResponse>(observer =>
+           {
+               var port = new SerialPort(this.COMPort, this.COMBaudRate, Parity.None, 8, StopBits.One);
+
+               Task.Run(() =>
+               {
+                   ManualResetEvent waitCancel = new(false);
+                   _ResponseCanceller.Token.Register(() =>
+                   {
+                       observer.OnCompleted();
+                       waitCancel.Set();
+                   });
+
+                   port.ErrorReceived += (s, e) =>
+                   {
+                       // shutdown on error
+                       observer.OnCompleted();
+                       waitCancel.Set();
+                   };
+
+                   port.Open();
+
+                   if (this.IsSimulator == false)
+                   {
+                       // disable two byte address mode using broadcast
+                       NextionDevice.IssueBroadcastCommand(port, "addr=0");
+
+                       // these commands ensure that nextion device is ready to receive further commands
+                       NextionDevice.IssueCommandBatch(port, new string[] {
+                        "addr=0", // disable two byte address mode
+                        "ussp=0", // never sleep when no serial command
+                        "thsp=0", // do not sleep when no touch
+                        "thup=1", // wake on touch
+                        "bkcmd=2", // only error codes
+                        "sleep=0", // exit sleep mode
+                    });
+
+                   }
+
+                   port.WriteTimeout = 1000;
+                   port.DiscardInBuffer();
+
+                   NextionDevice.IssueBroadcastCommand(port, "addr=0");
+
+                   MemoryStream ms = new(1024);
+                   port.DataReceived += (s, e) =>
+                   {
+                       byte[] buffer = null;
+                       while (port.BytesToRead > 0)
+                       {
+                           var toRead = port.BytesToRead;
+
+                           // we try to read into memory stream buffer directly without intermidaries
+                           ms.SetLength(ms.Length + toRead);
+                           buffer = ms.GetBuffer();
+                           ms.Position += port.Read(buffer, (int)ms.Position, toRead);
+                       }
+
+                       if (_IsUploadingFirmware)
+                       {
+                           buffer = ms.GetBuffer();
+
+                           if (buffer[0] == 0x05)
+                           {
+                               ms.SetLength(0);
+                               observer.OnNext(new NextionResponse()
+                               {
+                                   Code = "0x05",
+                                   Port = port
+                               });
+                           }
+                           return;
+                       }
+
+                       if (ms.Position == ms.Length &&
+                           ms.Position > 0 &&
+                           buffer[ms.Length - 1] == 255 && 
+                           buffer[ms.Length - 2] == 255 &&
+                           buffer[ms.Length - 3] == 255)
+                       {
+                           ms.Position = 0;
+                           foreach (var r in this.SplitResponse(ms))
+                           {
+                               r.Port = port;
+                               observer.OnNext(r);
+                           }
+
+                           // clear buffer once we found termination
+                           ms.SetLength(0);
+                           ms.Position = 0;
+                       }
+
+                   };
+
+                   observer.OnNext(new NextionResponse()
+                   {
+                       Port = port
+                   });
+
+                   waitCancel.WaitOne();
+
+                   port.Close();
+                   port.Dispose();
+
+                   _WaitForDisconnect.Set();
+               });
+
+               return () =>
+               {
+                   _ResponseCanceller.Cancel();
+                   _ResponseCanceller.Dispose();
+                   _ResponseSubject = null;
+                   _ResponseCanceller = null;
+               };
+
+           }).Replay(1).RefCount(1);
+
+            if (onCompleted != null)
+            {
+                return _ResponseSubject.Subscribe(observer, onCompleted);
+            }
+
+            return _ResponseSubject.Subscribe(observer);
+        }
+
+        /// <summary>
+        /// Forces active connection to close.
+        /// Normally connection will close automatically as soon
+        /// as no subscriber is subscribed to Connect function
+        /// 
+        /// Current subscriber will receive OnCompleted if they provide the handler during subscription
+        /// </summary>
+        public async Task ForceDisconnect(int timeout = 1000)
+        {
+            if (_ResponseCanceller == null || _ResponseSubject == null)
             {
                 return;
             }
 
-            while (_Port.BytesToRead > 0)
-            {
-                _InBuffer.Add(_Port.ReadByte());
+            _ResponseCanceller.Cancel();
 
-                if (_InBuffer.Count >= 4 &&
-                    _InBuffer[_InBuffer.Count - 1] == 255 &&
-                    _InBuffer[_InBuffer.Count - 2] == 255 &&
-                    _InBuffer[_InBuffer.Count - 3] == 255)
-                {
-                    if (_InBuffer.Count == 4)
-                    {
-                        // short command with only response code
-                        this.NewResponse(new NextionResponse()
-                        {
-                            Code = "0x" + _InBuffer[0].ToString("X2")
-                        });
-                    }
-                    else
-                    {
-                        var response = _InBuffer
-                                            .Take(_InBuffer.Count - 3)
-                                            .Select(b => (byte)b)
-                                            .ToArray();
-
-                        this.NewResponse(new NextionResponse()
-                        {
-                            Code = "0x" + _InBuffer[0].ToString("X2"),
-                            Data = System.Text.Encoding.ASCII.GetString(response, 1, response.Length - 1)
-                        });
-                    }
-
-                    _WaitResponse.Set();
-                    _InBuffer.Clear();
-
-                }
-            }
-        }
-
-        /// <summary>
-        /// Occured when tnew response from nextion is received
-        /// first string is the response code (HEX), string contains data (if any)
-        /// </summary>
-        public event Action<NextionResponse> NewResponse = delegate { };
-
-        /// <summary>
-        /// Send command to nextion and wait for response code
-        /// </summary>
-        /// <param name="command"></param>
-        /// <returns>Response code (First Byte of nextion response)</returns>
-        public async Task<List<NextionResponse>> IssueCommand(string command)
-        {
-            if (this.IsDisposed)
-            {
-                return null;
-            }
-
-            _Port.DiscardInBuffer();
-            _Port.DiscardOutBuffer();
-
-            List<NextionResponse> responses = new List<NextionResponse>();
-
+            bool success = false;
             await Task.Run(() =>
             {
-                var lastResponse = DateTime.Now;
-                Action<NextionResponse> captureResponse = (r) =>
-                {
-                    responses.Add(r);
-                };
-
-                try
-                {
-                    NextionDevice.IssueCommand(_Port, "bkcmd=3");
-                    _WaitResponse.WaitOne();
-                    _WaitResponse.Reset();
-
-                    _Port.DiscardInBuffer();
-
-                    this.NewResponse += captureResponse;
-                    NextionDevice.IssueCommand(_Port, command);
-                    _WaitResponse.WaitOne();
-                    _WaitResponse.Reset();
-
-                    NextionDevice.IssueCommand(_Port, "bkcmd=2");
-
-                    Task.Delay(1000).Wait();
-                }
-                catch (Exception)
-                {
-                    this.Dispose();
-                }
-
-                this.NewResponse -= captureResponse;
+                success = _WaitForDisconnect.WaitOne(timeout);
             });
 
-            if (this.IsDisposed == false)
+            if (!success)
             {
-                _Port.DiscardInBuffer();
-                _Port.DiscardOutBuffer();
+                throw new TimeoutException("Timed out waiting for connection to close");
             }
-
-            return responses;
         }
 
         /// <summary>
-        /// Issue command without waiting for response
+        /// Issue command and wait for response, automatically change mode to bkcmd=3
+        /// and switched back to bkcmd=0 when response is received.
+        /// 
+        /// In normal operation, User is expected to use connect to send/recive data with nextion
         /// </summary>
         /// <param name="command"></param>
-        /// <returns></returns>
-        public void IssueCommandAndForget(string command)
+        public async Task<NextionResponse> IssueCommand(string command, int timeout = 1500)
         {
-            if (this.IsDisposed)
+            int step = 0;
+            NextionResponse r = null;
+            ManualResetEvent wait = new(false);
+
+            IDisposable observer = null;
+            observer = this.Connect(callback =>
             {
-                return;
-            }
-
-            try
-            {
-                NextionDevice.IssueCommand(_Port, command);
-            }
-            catch (Exception)
-            {
-                this.Dispose();
-            }
-        }
-
-        private MemoryStream _CommandBuffer = new MemoryStream(1024);
-
-        /// <summary>
-        /// Buffer a command to nextion device
-        /// </summary>
-        /// <param name="command"></param>
-        public void BufferCommand(string command)
-        {
-            if (this.IsDisposed)
-            {
-                return;
-            }
-
-            if (_CommandBuffer == null)
-            {
-                _CommandBuffer = new MemoryStream(1024);
-                return;
-            }
-
-            var ascii = System.Text.Encoding.ASCII.GetBytes(command + "AAA");
-            ascii[ascii.Length - 1] = 255;
-            ascii[ascii.Length - 2] = 255;
-            ascii[ascii.Length - 3] = 255;
-            _CommandBuffer.Write(ascii, 0, ascii.Length);
-        }
-
-        /// <summary>
-        /// Flush the command buffer
-        /// </summary>
-        public void FlushCommandBuffer()
-        {
-            if (_Port == null)
-            {
-                return; // other thread have closed the connection
-            }
-
-            if (_Port.IsOpen == false)
-            {
-                return;
-            }
-
-            if (_CommandBuffer == null || _CommandBuffer.Length == 0)
-            {
-                return;
-            }
-
-            lock (this)
-            {
-                var bytes = _CommandBuffer.GetBuffer();
-                var wait = new ManualResetEventSlim(false);
-
-                Task.Run(() =>
+                switch (step)
                 {
-                    try
-                    {
-                        _Port.Write(bytes, 0, (int)_CommandBuffer.Position);
+                    case 0:
+                        // always get response from nextion
+                        NextionDevice.IssueCommand(callback.Port, "bkcmd=3");
+                        step = 1;
+                        return;
+
+                    case 1:
+                        NextionDevice.IssueCommand(callback.Port, command);
+                        step = 2;
+                        return;
+
+                    case 2:
+                        r = callback;
+                        observer.Dispose();
                         wait.Set();
-                    }
-                    catch (Exception)
-                    {
-                        this.Dispose();
-                    }
-                });
 
-                var isset = wait.Wait(2000);
-                if (isset == false)
-                {
-                    this.Dispose();
+                        NextionDevice.IssueCommand(callback.Port, "bkcmd=0");
+                        return;
                 }
 
-                _CommandBuffer.Dispose();
-                _CommandBuffer = new MemoryStream();
+            });
+
+            bool waitSuccess = false;
+            await Task.Run(() =>
+            {
+                waitSuccess = wait.WaitOne(timeout);
+            });
+
+            if (waitSuccess == false)
+            {
+                throw new TimeoutException("Timeout waiting for nextion to respond");
             }
+
+            return r;
         }
 
         /// <summary>
-        /// Buffer a command to nextion device and flush afterwards
-        /// </summary>
-        /// <param name="command"></param>
-        public void BatchCommands(IEnumerable<string> command)
-        {
-            if (_Port == null)
-            {
-                return; // other thread have closed the connection
-            }
-
-            this.BufferCommand("com_stop");
-
-            foreach (var cmd in command)
-            {
-                this.BufferCommand(cmd);
-            }
-
-            this.BufferCommand("com_star");
-            this.FlushCommandBuffer();
-        }
-
-
-        /// <summary>
-        /// Upload new firmware, after firmware is updated the device will reconnect
-        /// However, the connection may not be successful if Baud Rate is changed by firmware
+        /// Upload Firmware to nextion device
         /// </summary>
         /// <param name="path"></param>
-        public async Task UploadFirmware(string path)
+        /// <returns></returns>
+        public async Task UploadFirmware(byte[] firmwareData)
         {
-            var nextionReady = new ManualResetEventSlim(false);
-            var updateComplete = new ManualResetEvent(false);
+            var firmware = new MemoryStream(firmwareData);
 
-            this.Initialize((s, e) =>
+            NextionSession session = new();
+
+            session.AtFirst().OnAnyCallback((callback) =>
             {
-                try
+                NextionDevice.IssueCommandBatch(callback.Port, new string[]
                 {
-                    if (_Port.IsOpen == false)
-                    {
-                        updateComplete.Set();
-                        return;
-                    }
+                    "ussp=0",
+                    "thsp=0",
+                    "sleep=0",
+                    "dim=50",
+                });
 
-                    if (_Port.BytesToRead == 1)
-                    {
-                        var ready = _Port.ReadByte();
-                        if (ready == 5)
-                        {
-                            nextionReady.Set();
-                        }
+                Task.Delay(1000).Wait();
 
-                        return;
-                    }
+                callback.Port.DiscardInBuffer();
+                callback.Port.DiscardOutBuffer();
 
-                    // probably nextion power on status
-                    if (_Port.BytesToRead > 1)
-                    {
-                        updateComplete.Set();
-                    }
-                }
-                catch (Exception)
-                {
-                    updateComplete.Set();
-                }
+                _IsUploadingFirmware = true;
+                NextionDevice.IssueCommand(callback.Port, $"whmi-wri {firmware.Length},921600,a");
 
-            }, 1);
+            }, @goto: "waitupload");
 
-            this.BatchCommands(new string[]
+            session.When("waitupload").On("0x05", (callback) =>
             {
-                "ussp=0",
-                "thsp=0",
-                "sleep=0",
-                "dim=50",
+                _IsUploadingFirmware = true;
+
+                var buffer = new byte[4096];
+                var read = firmware.Read(buffer, 0, buffer.Length);
+
+                callback.Port.Write(buffer, 0, read);
+
+                if (firmware.Position == firmware.Length)
+                {
+                    return "waitForLastBlock";
+                }
+
+                return "waitupload";
             });
 
-            await Task.Delay(1000);
-
-            var fi = new FileInfo(path);
-            NextionDevice.IssueCommand(_Port, string.Format("whmi-wri {0},{1},a", fi.Length, 921600));
-
-            await Task.Delay(2000);
-
-            _Port.BaudRate = 921600;
-            _Port.DiscardInBuffer();
-
-            await Task.Delay(2000);
-
-            // Read Firmware and write to device in 4K blocks
-#pragma warning disable CS4014 // Because this call is not awaited, execution of the current method continues before the call is completed
-            Task.Run(() =>
+            session.When("waitForLastBlock").On("0x05", (callback) =>
             {
-                using (var f = File.OpenRead(path))
-                {
-                    var buffer = new byte[4096];
-                    while (true)
-                    {
-                        nextionReady.Reset();
+                _IsUploadingFirmware = false;
 
-                        var read = f.Read(buffer, 0, buffer.Length);
-                        _Port.Write(buffer, 0, buffer.Length);
+            }, @goto: "waitForPowerOn");
 
-                        nextionReady.Wait();
-
-                        if (read < buffer.Length) // last block
-                        {
-                            break;
-                        }
-                    }
-
-                }
-            });
-#pragma warning restore CS4014 // Because this call is not awaited, execution of the current method continues before the call is completed
-
-            var result = true;
-            await Task.Run(() =>
+            session.When("waitForPowerOn").OnAnyCallback((callback) =>
             {
-                result = updateComplete.WaitOne(60000);
+                session.End();
             });
 
-            if (result == false)
-            {
-                this.Dispose();
-                throw new Exception("Timeout waiting for Nextion to Restart after Update");
-            }
+            await this.ForceDisconnect();
 
-            this.Initialize(_Port_DataReceived);
+            session.Begin(this);
+            await session.WaitAsync(60000);
         }
 
         /// <summary>
@@ -536,21 +441,8 @@ namespace NC.Nextion
         /// </summary>
         public void Dispose()
         {
-            this.IsDisposed = true;
-
-            if (_Port != null)
-            {
-                var port = _Port;
-                Task.Run(() =>
-                {
-                    port.DiscardInBuffer();
-                    port.DiscardOutBuffer();
-                    port.Close();
-                    port.Dispose();
-                });
-            }
-
-            _Port = null;
+            _ResponseCanceller?.Cancel();
+            _ResponseCanceller?.Dispose();
 
             GC.SuppressFinalize(this);
         }

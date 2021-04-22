@@ -1,7 +1,10 @@
 ﻿using System;
+using System.Collections.Generic;
+using System.IO;
 using System.IO.Ports;
 using System.Linq;
 using System.Reactive.Linq;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -9,26 +12,109 @@ namespace NC.Nextion
 {
     public partial class NextionDevice
     {
-        private static void IssueCommand(SerialPort port, string command)
+        private static void SyncWrite(SerialPort port, byte[] buffer, int length)
         {
-            var ascii = System.Text.Encoding.ASCII.GetBytes(command + "AAA");
-            ascii[ascii.Length - 1] = 255;
-            ascii[ascii.Length - 2] = 255;
-            ascii[ascii.Length - 3] = 255;
-
-            port.Write(ascii, 0, ascii.Length);
+            lock (port)
+            {
+                port.Write(buffer, 0, length);
+            }
         }
 
-        private static void IssueBroadcastCommand(SerialPort port, string command)
+        /// <summary>
+        /// Issue a Nextion command to serial port
+        /// </summary>
+        /// <param name="port"></param>
+        /// <param name="command"></param>
+        public static void IssueCommand(SerialPort port, string command)
         {
-            var ascii = System.Text.Encoding.ASCII.GetBytes("AA" + command + "AAA");
-            ascii[0] = 255;
-            ascii[1] = 255;
-            ascii[ascii.Length - 1] = 255;
-            ascii[ascii.Length - 2] = 255;
-            ascii[ascii.Length - 3] = 255;
+            // allocate buffer and pre-filled with 255
+            var buffer = new byte[command.Length + 3];
+            Unsafe.InitBlock(ref buffer[0], 255, (uint)buffer.Length);
 
-            port.Write(ascii, 0, ascii.Length);
+            // overwrite it with ASCII
+            // format is: command??? where ? = 255
+            var span = new Span<byte>(buffer, 0, command.Length);
+            System.Text.Encoding.ASCII.GetBytes(command, span);
+
+            NextionDevice.SyncWrite(port, buffer, buffer.Length);
+        }
+
+        /// <summary>
+        /// Issue command batch to nextion device
+        /// </summary>
+        /// <param name="port"></param>
+        /// <param name="commands"></param>
+        public static void IssueCommandBatch(SerialPort port, IEnumerable<string> commands)
+        {
+            // allocate buffer and pre-filled with 255
+            var buffer = new byte[1024];
+            Unsafe.InitBlock(ref buffer[0], 255, (uint)buffer.Length);
+
+            var position = 0;
+            Action<string> appendCommand = (command) =>
+            {
+                if (command.Length + 3 + position > 1024)
+                {
+                    throw new InvalidOperationException("Buffer is now too large");
+                }
+
+                var span = new Span<byte>(buffer, position, command.Length + 3);
+                System.Text.Encoding.ASCII.GetBytes(command, span);
+
+                position += (command.Length + 3);
+            };
+
+            appendCommand("com_stop");
+
+            foreach (var item in commands)
+            {
+                appendCommand(item);
+            }
+
+            appendCommand("com_star");
+
+            NextionDevice.SyncWrite(port, buffer, position);
+        }
+
+
+
+        public static Task IssueFadeCommand( SerialPort port, int from, int to, int step = 10, int delay = 75 )
+        {
+            var cmd = new List<string>();
+            var inc = to > from ? 1 : -1;
+
+            Func<int, bool> willStop = (i) => to > from ? (i <= to) : (i >= to);
+
+            var y = 0;
+            cmd.Add("sleep=0");
+            for (int i = from; willStop(i); i += inc * step)
+            {
+                cmd.Add($"dim={i}");
+                cmd.Add($"delay={delay}");
+            }
+
+            NextionDevice.IssueCommandBatch(port, cmd);
+
+            return Task.Delay(step * (delay + 10));
+        }
+
+        /// <summary>
+        /// Issue a Nextion Broadcast command to serial port
+        /// </summary>
+        /// <param name="port"></param>
+        /// <param name="command"></param>
+        public static void IssueBroadcastCommand(SerialPort port, string command)
+        {
+            // allocate buffer and pre-filled with 0
+            var buffer = new byte[command.Length + 5];
+            Unsafe.InitBlock(ref buffer[0], 255, (uint)buffer.Length);
+
+            // overwrite it with ASCII from command
+            // format is: ??command??? where ? = 255
+            var span = new Span<byte>(buffer, 2, command.Length);
+            System.Text.Encoding.ASCII.GetBytes(command, span);
+
+            NextionDevice.SyncWrite(port, buffer, buffer.Length);
         }
 
         private static bool _IsFinding = false;
@@ -38,7 +124,7 @@ namespace NC.Nextion
         /// </summary>
         /// <param name="portNames">Port names to search</param>
         /// <param name="exceptPortNames">Port names to skip search</param>
-        public static async Task<NextionDeviceFindResult> Find(string[] portNames = null, string[] exceptPortNames = null)
+        public static async Task<NextionDeviceFindResult> Find(IEnumerable<string> portNames = null, IEnumerable<string> exceptPortNames = null)
         {
             if (_IsFinding)
             {
@@ -56,11 +142,15 @@ namespace NC.Nextion
                 portNames = portNames.Except(exceptPortNames).ToArray();
             }
 
-            var bauds = new int[] { 921600, 9600, 115200, 2400, 4800, 19200, 31250, 38400, 57600, 230400, 250000, 256000, 512000 };
+            var bauds = new int[] { 921600, 115200, 9600, 2400, 4800, 19200, 31250, 38400, 57600, 230400, 250000, 256000, 512000 };
+
+#if DEBUG
+
+            bauds = new int[] { 921600, 115200};
+#endif
 
             Func<string, int, (bool ok, string returnString)> testPort = (port, baud) =>
             {
-                bool shouldRetry = true;
             Retry:
 
                 (bool ok, string returnString) testResult = (false, null);
@@ -84,18 +174,32 @@ namespace NC.Nextion
                                 var result = comport.ReadTo(TERMINATION);
                                 if (result.Contains("comok"))
                                 {
-                                    testResult.returnString = result.Substring(result.IndexOf("comok"));
+                                    testResult.returnString = result;
+                                    comport.DiscardInBuffer();
                                     ev.Set();
+
+                                    return;
                                 }
+                                else
+                                {
+                                    // maybe simulator
+                                    if ( System.Text.ASCIIEncoding.ASCII.GetBytes(result)[0] == 26 )
+                                    {
+                                        // simulator return "invalid command"
+                                        
+                                        testResult.returnString = "comok 1,38024-2556,Simulator,99,999,I-AM-SIMULATOR--,16777216";
+                                        comport.DiscardInBuffer();
+                                        ev.Set();
+
+                                        return;
+                                    }
+                                }
+
                             }
                         }
                         catch (Exception)
                         {
                             ev.Set();
-                            if (testResult.returnString == null)
-                            {
-                                shouldRetry = true;
-                            }
                         }
 
                     };
@@ -114,13 +218,6 @@ namespace NC.Nextion
                     }
 
                 }
-                catch (UnauthorizedAccessException ex)
-                {
-                    shouldRetry = true;
-                }
-                catch (Exception ex)
-                {
-                }
                 finally
                 {
                     // needs to spawn thread because sometimes 
@@ -138,20 +235,11 @@ namespace NC.Nextion
                     });
                 }
 
-                if (testResult.ok == false && shouldRetry == true)
-                {
-                    shouldRetry = false;
-
-                    Task.Delay(1000).Wait();
-
-                    goto Retry;
-                }
-
                 return testResult;
             };
 
             NextionDeviceFindResult findResult = null;
-            foreach (var portName in portNames.OrderBy(s => s))
+            foreach (var portName in portNames.Where( p => p.StartsWith("COM") ).OrderBy(s => s))
             {
                 foreach (var b in bauds)
                 {
